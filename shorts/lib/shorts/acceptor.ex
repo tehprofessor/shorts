@@ -24,6 +24,8 @@ defmodule Shorts.Acceptor do
     {:ok, socket} = :gen_tcp.accept(listener)
     :inet.setopts(socket, [{:packet, :http_bin}, {:active, :once}])
 
+    send(server, {:accepting, self()})
+
     {:noreply, %__MODULE__{server: server, writer: socket, request: %Request{}}}
   end
 
@@ -53,9 +55,11 @@ defmodule Shorts.Acceptor do
   @doc "Adds the http_method and path to the request struct"
   def handle_info({:http, _port, {:http_request, method, {:abs_path, path}, _http_version}}, conn) do
     request = %{%{conn.request | method: method} | path: path}
+
     log(["Request ", inspect(request.method), " @ ", request.path])
 
     send(self(), {:loop})
+    send(conn.server, {:busy, self()})
 
     {:noreply, %{conn | request: request}}
   end
@@ -63,6 +67,7 @@ defmodule Shorts.Acceptor do
   @doc "Handle :http_eoh (end of header), and read body"
   def handle_info({:http, _port, :http_eoh}, conn) do
     log(["End of Header"])
+
     send(self(), :route)
 
     {:noreply, conn}
@@ -82,12 +87,12 @@ defmodule Shorts.Acceptor do
   def handle_info({:checkin}, conn) do
     log("Starting checkinin acceptor")
 
-    Shorts.Server.checkin(conn.server, self())
+    send(conn.server, {:checkin, self()})
 
     {:noreply, %{conn | writer: nil, request: nil}}
   end
 
-  def handle_info(:route, %{request: %Request{method: :"GET"} = request} = conn) do
+  def handle_info(:route, %{request: %Request{method: :GET} = request} = conn) do
     log(["routing (do not read body)"])
 
     response = Shorts.Router.route(request)
@@ -106,10 +111,13 @@ defmodule Shorts.Acceptor do
     :inet.setopts(conn.writer, [:binary, {:packet, :raw}, {:active, false}])
 
     log([
-      "Set inet options", " ",
-      "request length:", " ",
+      "Set inet options",
+      " ",
+      "request length:",
+      " ",
       inspect(conn.request.length)
     ])
+
     # Read the data
     {:ok, data} = :gen_tcp.recv(conn.writer, conn.request.length)
 
@@ -126,18 +134,21 @@ defmodule Shorts.Acceptor do
   @doc "Sends the response"
   def handle_info({:send_response, response}, conn) do
     log(["send response"])
-    response_body = [
-                      "{\"short-url\":", " ",
-                      "my-url", "}"] |> to_string()
+    response_body = ["{\"short-url\":", " ", "my-url", "}"] |> to_string()
     response_length = byte_size(response.body) |> to_string()
     response_status = to_string(response.status)
 
     data = [
-      ["HTTP/1.1", " ", response_status, " ", "OK"], "\r\n",
-      ["Server:", " ", "ShortUrl"], "\r\n",
-      ["Content-Length:", " ", response_length], "\r\n",
-      ["Content-Type:", " ", "application/json"], "\r\n",
-      ["Connection:", " ", "Close"], "\r\n",
+      ["HTTP/1.1", " ", response_status, " ", "OK"],
+      "\r\n",
+      ["Server:", " ", "ShortUrl"],
+      "\r\n",
+      ["Content-Length:", " ", response_length],
+      "\r\n",
+      ["Content-Type:", " ", "application/json"],
+      "\r\n",
+      ["Connection:", " ", "Close"],
+      "\r\n",
       ["\r\n"],
       [response.body]
     ]
@@ -168,9 +179,9 @@ defmodule Shorts.Acceptor do
   @doc """
   Logging is insanely slow, this is kind of crazy to see, uncomment to find out
   """
-  defp log(_message) do
-#    ["[acceptor", inspect(self()), "]", " ", message]
-#    |> Enum.join("")
-#    |> Logger.info()
+  defp log(message) do
+    ["[acceptor", inspect(self()), "]", " ", message]
+    |> Enum.join("")
+    |> Logger.info()
   end
 end

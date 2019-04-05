@@ -6,7 +6,7 @@ defmodule Shorts.GetShortUrl do
   def handle_request(url) do
     %Response{
       body: "{\"url\": \"https://www.weedmaps.com\"}",
-      status: 200,
+      status: 200
     }
   end
 end

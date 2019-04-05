@@ -6,7 +6,7 @@ defmodule Shorts.NewShortUrl do
   def handle_request(url) do
     %Response{
       body: "{\"short-code\": \"MMCOFFEEISGOOD321\"}",
-      status: 201,
+      status: 201
     }
   end
 end

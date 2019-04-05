@@ -2,6 +2,10 @@
 # and its dependencies with the aid of the Mix.Config module.
 use Mix.Config
 
+config :shorts,
+  ip_address: System.get_env("SHORTS_IP") || "127.0.0.1",
+  port: System.get_env("SHORTS_PORT") || 4020
+
 # This configuration is loaded before any dependency and is restricted
 # to this project. If another project depends on this project, this
 # file won't be loaded nor affect the parent project. For this reason,
@@ -10,7 +14,7 @@ use Mix.Config
 
 # You can configure your application as:
 #
-#     config :shorts, key: :value
+#
 #
 # and access this configuration in your application as:
 #

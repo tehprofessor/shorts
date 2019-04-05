@@ -5,108 +5,109 @@ defmodule Shorts.Server do
 
   use GenServer
 
-  # Acceptor Counter Identifiers
-  @acceptors_waiting 1
-  @acceptors_running 2
-
   defmodule Connection do
-    defstruct [:listener, :port, :pool_size, :acceptors, :acceptor_counter]
+    defstruct [
+      :acceptor_pool,
+      :ip_address,
+      :listener,
+      :port,
+      :pool_size,
+      :acceptors,
+      :acceptor_counter
+    ]
   end
 
-  def serve!(port \\ 4020, opts \\ [pool_size: 500]) do
+  def serve!(port \\ 4020, opts \\ [pool_size: 1, ip_address: {192, 168, 1, 177}]) do
     %Connection{
+      ip_address: config(:ip_address, opts[:ip_address]),
       port: port,
-      pool_size: opts[:pool_size],
-      acceptors: :queue.new(),
-      acceptor_counter: :counters.new(2, [:atomics]),
-    } |> start_link()
+      pool_size: config(:pool_size, opts[:pool_size]),
+    }
+    |> start_link()
   end
+
+  def status() do
+    GenServer.call(__MODULE__, :status)
+  end
+
+  ## @behaviour GenServer
 
   def start_link(connection) do
-    GenServer.start_link(__MODULE__, connection, [])
+    GenServer.start_link(__MODULE__, connection, name: __MODULE__)
   end
 
-  def init(%{port: port, pool_size: pool_size} = conn) do
-    # Setup the listener, set the packet type to be http, and `{:active, true}` to
-    # receive messages in this process via `handle_info/2` calls.
-    IO.inspect(["port", port, pool_size])
-    {:ok, listener} = :gen_tcp.listen(port, [{:packet, :http}, {:active, false}])
+  def init(conn), do: {:ok, conn, {:continue, :create_listener}}
+
+  def handle_continue(
+        :create_listener,
+        %{port: port, pool_size: pool_size, ip_address: ip_address} = conn
+      ) do
+    {:ok, listener} =
+      :gen_tcp.listen(port, [{:ip, ip_address}, {:packet, :http}, {:active, false}])
+
+
+    pool = AcceptorPool.new(:free, :accepting, :busy, pool_size)
+    send(self(), :loop)
+
+    {:noreply, %{%{conn | listener: listener} | acceptor_pool: pool}}
+  end
+
+  def handle_call(:status, _from, conn) do
+    pool_info = AcceptorPool.info(conn.acceptor_pool)
+
+    {:reply, pool_info, conn}
+  end
+
+  def handle_cast(_msg, state), do: {:noreply, state}
+
+  def handle_call(_msg, _from, state), do: {:reply, :ok, state}
+
+  @doc "Checkin the acceptor, move from :busy -> :free"
+  def handle_info({:checkin, acceptor}, %{acceptor_pool: acceptor_pool} = conn) do
+    log(["handle_info({:checkin, acceptor}, conn)"])
+
+    {:ok, nil} = AcceptorPool.checkin(acceptor, acceptor_pool)
+    send(self(), :loop)
+
+    {:noreply, conn}
+  end
+
+  def handle_info({:busy, acceptor}, %{acceptor_pool: acceptor_pool} = conn) do
+    log(["handle_info({:loop, :running}, conn)"])
+    {:ok, _acceptor} = AcceptorPool.move(acceptor, :accepting, :busy, acceptor_pool)
 
     send(self(), :loop)
 
-    {:ok, %{conn | listener: listener}}
+    {:noreply, conn}
   end
 
-  def handle_continue() do
+  def handle_info({:accepting, acceptor}, %{acceptor_pool: pool} = conn) do
+    log(["handle_info({:accepting, acceptor}, conn)"])
+    {:ok, _acceptor} = AcceptorPool.move(acceptor, :free, :accepting, pool)
 
+    {:noreply, conn}
   end
 
-  def checkin(server, acceptor) do
-    log(["CHECKIN ACCEPTOR!!"])
-    GenServer.cast(server, {:checkin, acceptor})
-  end
+  def handle_info(:loop, %{acceptor_pool: pool} = conn) do
+    log(["Looping"])
 
-  @doc "Checkin the acceptor"
-  def handle_cast({:checkin, acceptor}, conn) do
-    log(["checkin acceptor!"])
-    acceptors = :queue.in(acceptor, conn.acceptors)
-
-    # Decrease running acceptors by one
-    :counters.sub(conn.acceptor_counter, @acceptors_running, 1)
-    # Increase waiting acceptors by one
-    :counters.add(conn.acceptor_counter, @acceptors_waiting, 1)
-
-    send(self(), :loop)
-
-    {:noreply, %{conn | acceptors: acceptors}}
-  end
-
-  def handle_cast(_msg, state) do
-    {:noreply, state}
-  end
-
-  def handle_call(_msg, _from, state) do
-    {:reply, :ok, state}
-  end
-
-  def handle_info(:loop, state) do
-    log(["Setting up new loop"])
-    {acceptor, acceptors} = checkout(state)
-
-    # It's cool to accept in a child process,
-    # so that's where we'll block for the next connection.
-    send(acceptor, {:accept, state.listener, self()})
-
-    {:noreply, %{state | acceptors: acceptors}}
-  end
-
-  @doc """
-  Checkout an acceptor from the pool. Marks it as in use by
-  incrementing the connection's @acceptors_running counter and
-  decreasing the @acceptors_waiting counter.
-  """
-  defp checkout(%{acceptors: acceptor_pool} = conn) do
-    log(["Checking out an acceptor"])
-    acceptors = case :queue.out(acceptor_pool) do
-      {{:value, acceptor}, acceptors} ->
-        # If we pop an acceptor from the pool, decrement the waiting
-        # counter by 1.
-        :counters.sub(conn.acceptor_counter, @acceptors_waiting, 1)
-        {acceptor, acceptors}
-      {:empty, acceptors} ->
-        {:ok, acceptor} = Shorts.Acceptor.start_link()
-        {acceptor, acceptors}
+    _ = with {:ok, acceptor} <- AcceptorPool.checkout(pool) do
+      send(acceptor, {:accept, conn.listener, self()})
     end
 
-    # Increase the running count.
-    :counters.add(conn.acceptor_counter, @acceptors_running, 1)
-    acceptors
+    {:noreply, conn}
   end
 
   @doc """
   Logging is insanely slow, this is kind of crazy to see, uncomment to find out
   """
   defp log(message) do
-#    IO.inspect(["[server", self(), "]", " ", message])
+    ["[server", inspect(self()), "]", " ", message]
+    |> Enum.join("")
+    |> Logger.info()
   end
+
+  defp config(key, nil), do: Application.get_env(:shorts, key)
+
+  defp config(_key, override), do: override
 end
