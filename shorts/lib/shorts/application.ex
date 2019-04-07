@@ -8,8 +8,7 @@ defmodule Shorts.Application do
   def start(_type, _args) do
     # List all child processes to be supervised
     children = [
-      # Starts a worker by calling: Shorts.Worker.start_link(arg)
-      # {Shorts.Worker, arg},
+      {Shorts.Server, [port: 4020, pool_size: 8, ip_address: {192, 168, 1, 177}]}
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html

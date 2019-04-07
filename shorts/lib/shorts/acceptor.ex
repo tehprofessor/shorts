@@ -6,7 +6,7 @@ defmodule Shorts.Acceptor do
 
   alias Shorts.Request
 
-  defstruct [:writer, :request, :server]
+  defstruct [:listener, :writer, :request]
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, :ok, opts)
@@ -19,14 +19,19 @@ defmodule Shorts.Acceptor do
   end
 
   @doc "Tell the acceptor, to accept a connection"
-  def handle_info({:accept, listener, server}, _conn) do
-    log("Waiting for request ...")
-    {:ok, socket} = :gen_tcp.accept(listener)
-    :inet.setopts(socket, [{:packet, :http_bin}, {:active, :once}])
+  def handle_info({:accept, listener}, conn) do
+    log("Accept -> Waiting for request ...")
 
-    send(server, {:accepting, self()})
+    with {:ok, socket} <- :gen_tcp.accept(listener) do
+      :inet.setopts(socket, [{:packet, :http_bin}, {:active, :once}, {:send_timeout_close, true}])
 
-    {:noreply, %__MODULE__{server: server, writer: socket, request: %Request{}}}
+      {:noreply, %__MODULE__{listener: listener, writer: socket, request: %Request{}}}
+    else
+      {:error, timeout} ->
+        send(self(), {:accept, listener})
+
+        {:noreply, conn}
+    end
   end
 
   def handle_info({:loop}, conn) do
@@ -37,13 +42,23 @@ defmodule Shorts.Acceptor do
 
   @doc "Handle errors, likely from the recvbuf not being big enough (the OS will fix it)"
   def handle_info({:tcp_error, _port, message}, conn) do
-    log("Error! #{inspect(message)}")
+    log(["Error! -> received `:tcp_error` #{inspect(message)}"])
+    {:noreply, conn}
+  end
+
+  @doc "Handle timeout"
+  def handle_info({:error, :timeout}, %{listener: listener} = conn) do
+    log(["ERROR! -> received timeout... Closing socket."])
+    :gen_tcp.close(conn.writer)
+
+    send(self(), {:accept, listener})
+
     {:noreply, conn}
   end
 
   @doc "Set all other headers"
   def handle_info({:http, _port, {:http_header, _line_maybe, field, _reserved, value}}, conn) do
-    log([to_string(field), ":", " ", value])
+    log(["Header ->", " ", to_string(field), ":", " ", value])
     request = handle_header(field, value, conn.request)
 
     # Continue to the next header
@@ -55,18 +70,16 @@ defmodule Shorts.Acceptor do
   @doc "Adds the http_method and path to the request struct"
   def handle_info({:http, _port, {:http_request, method, {:abs_path, path}, _http_version}}, conn) do
     request = %{%{conn.request | method: method} | path: path}
-
-    log(["Request ", inspect(request.method), " @ ", request.path])
+    log(["Request ->", " ", inspect(request.method), " @ ", request.path])
 
     send(self(), {:loop})
-    send(conn.server, {:busy, self()})
 
     {:noreply, %{conn | request: request}}
   end
 
   @doc "Handle :http_eoh (end of header), and read body"
   def handle_info({:http, _port, :http_eoh}, conn) do
-    log(["End of Header"])
+    log(["Header -> End"])
 
     send(self(), :route)
 
@@ -74,26 +87,28 @@ defmodule Shorts.Acceptor do
   end
 
   @doc "Handle the connection closed event and return this acceptor to the pool."
-  def handle_info({:tcp_closed, _port}, conn) do
+  def handle_info({:tcp_closed, _port}, %{listener: listener} = conn) do
     # Log the connection being closed
-    log(["TCP connection closed ..."])
-    # Checkin the acceptor
-    send(self(), {:checkin})
-    # {:ok, writer} = :gen_tcp.accept(conn.listener)
+    log(["TCP connection closed ...", "Going to checkin self for reuse."])
+    # Checkin the acceptor and start accepting again.
+    send(self(), {:accept, listener})
+
     {:noreply, %{conn | writer: nil, request: nil}}
   end
 
   @doc "Checkin the acceptor"
-  def handle_info({:checkin}, conn) do
-    log("Starting checkinin acceptor")
+  def handle_info({:checkin}, %{listener: listener} = conn) do
+    log("Checkin -> Go... ?")
 
-    send(conn.server, {:checkin, self()})
+    send(self(), {:accept, listener})
 
-    {:noreply, %{conn | writer: nil, request: nil}}
+    {:noreply, conn}
   end
 
   def handle_info(:route, %{request: %Request{method: :GET} = request} = conn) do
-    log(["routing (do not read body)"])
+    log(["routing -> no-read-body"])
+
+    :inet.setopts(conn.writer, [:binary, {:packet, :raw}, {:active, false}])
 
     response = Shorts.Router.route(request)
 
@@ -104,7 +119,7 @@ defmodule Shorts.Acceptor do
 
   @doc "Routes the request"
   def handle_info(:route, %{request: request} = conn) do
-    log(["routing"])
+    log(["routing -> read-body"])
     # To receive the body we need to change the connection packet option
     # to 'raw'. `{:active, false}` lets us receive the data by calling
     # `gen_tcp.recv/2` instead of waiting for a message.
@@ -133,8 +148,8 @@ defmodule Shorts.Acceptor do
 
   @doc "Sends the response"
   def handle_info({:send_response, response}, conn) do
-    log(["send response"])
-    response_body = ["{\"short-url\":", " ", "my-url", "}"] |> to_string()
+    log(["Send -> Response"])
+    response_body = ["{\"url\":", " ", "my-url", "}"] |> to_string()
     response_length = byte_size(response.body) |> to_string()
     response_status = to_string(response.status)
 
@@ -153,12 +168,13 @@ defmodule Shorts.Acceptor do
       [response.body]
     ]
 
-    send(self(), {:checkin})
     # Send the response
     :gen_tcp.send(conn.writer, data)
 
     # Close the connection
     :gen_tcp.close(conn.writer)
+
+    send(self(), {:checkin})
 
     {:noreply, conn}
   end

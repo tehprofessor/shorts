@@ -11,19 +11,25 @@ defmodule Shorts.Server do
       :ip_address,
       :listener,
       :port,
-      :pool_size,
-      :acceptors,
-      :acceptor_counter
+      :pool_size
     ]
   end
 
-  def serve!(port \\ 4020, opts \\ [pool_size: 1, ip_address: {192, 168, 1, 177}]) do
-    %Connection{
+  def serve!(port \\ 4020, opts \\ [pool_size: 8, ip_address: {192, 168, 1, 177}]) do
+    connection = %Connection{
       ip_address: config(:ip_address, opts[:ip_address]),
       port: port,
-      pool_size: config(:pool_size, opts[:pool_size]),
+      pool_size: config(:pool_size, opts[:pool_size])
     }
-    |> start_link()
+
+    {:ok, server} = start_link(4020)
+
+    server
+  end
+
+  # Kick everyone outta the pool
+  def pee! do
+    GenServer.call(__MODULE__, :pee!)
   end
 
   def status() do
@@ -32,7 +38,13 @@ defmodule Shorts.Server do
 
   ## @behaviour GenServer
 
-  def start_link(connection) do
+  def start_link(opts \\ [port: 4020, pool_size: 8, ip_address: {192, 168, 1, 177}]) do
+    connection = %Connection{
+      ip_address: config(:ip_address, opts[:ip_address]),
+      port: opts[:port],
+      pool_size: config(:pool_size, opts[:pool_size])
+    }
+
     GenServer.start_link(__MODULE__, connection, name: __MODULE__)
   end
 
@@ -43,13 +55,24 @@ defmodule Shorts.Server do
         %{port: port, pool_size: pool_size, ip_address: ip_address} = conn
       ) do
     {:ok, listener} =
-      :gen_tcp.listen(port, [{:ip, ip_address}, {:packet, :http}, {:active, false}])
+      :gen_tcp.listen(port, [
+        {:ip, ip_address},
+        {:reuseaddr, true},
+        {:packet, :http},
+        {:active, false},
+        {:send_timeout_close, false},
+        {:keepalive, true},
+        {:delay_send, true}
+      ])
 
-
-    pool = AcceptorPool.new(:free, :accepting, :busy, pool_size)
+    pool = AcceptorPool.new(pool_size)
     send(self(), :loop)
 
     {:noreply, %{%{conn | listener: listener} | acceptor_pool: pool}}
+  end
+
+  def handle_call(:pee!, _from, conn) do
+    Process.exit(self(), :stop)
   end
 
   def handle_call(:status, _from, conn) do
@@ -62,38 +85,14 @@ defmodule Shorts.Server do
 
   def handle_call(_msg, _from, state), do: {:reply, :ok, state}
 
-  @doc "Checkin the acceptor, move from :busy -> :free"
-  def handle_info({:checkin, acceptor}, %{acceptor_pool: acceptor_pool} = conn) do
-    log(["handle_info({:checkin, acceptor}, conn)"])
-
-    {:ok, nil} = AcceptorPool.checkin(acceptor, acceptor_pool)
-    send(self(), :loop)
-
-    {:noreply, conn}
-  end
-
-  def handle_info({:busy, acceptor}, %{acceptor_pool: acceptor_pool} = conn) do
-    log(["handle_info({:loop, :running}, conn)"])
-    {:ok, _acceptor} = AcceptorPool.move(acceptor, :accepting, :busy, acceptor_pool)
-
-    send(self(), :loop)
-
-    {:noreply, conn}
-  end
-
-  def handle_info({:accepting, acceptor}, %{acceptor_pool: pool} = conn) do
-    log(["handle_info({:accepting, acceptor}, conn)"])
-    {:ok, _acceptor} = AcceptorPool.move(acceptor, :free, :accepting, pool)
-
-    {:noreply, conn}
-  end
-
   def handle_info(:loop, %{acceptor_pool: pool} = conn) do
-    log(["Looping"])
+    _ = log(["Looping"])
 
-    _ = with {:ok, acceptor} <- AcceptorPool.checkout(pool) do
-      send(acceptor, {:accept, conn.listener, self()})
-    end
+    _ =
+      with {:ok, acceptor} <- AcceptorPool.checkout(pool) do
+        _msg = send(acceptor, {:accept, conn.listener})
+        _msg = send(self(), :loop)
+      end
 
     {:noreply, conn}
   end
