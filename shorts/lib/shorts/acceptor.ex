@@ -6,7 +6,9 @@ defmodule Shorts.Acceptor do
 
   alias Shorts.Request
 
-  defstruct [:listener, :writer, :request]
+  @accept_type :accept
+
+  defstruct [:listener, :writer, :request, :ref]
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, :ok, opts)
@@ -16,6 +18,30 @@ defmodule Shorts.Acceptor do
     log(["Initializing acceptor()"])
 
     {:ok, nil}
+  end
+
+  @doc "Unblock my heart, say you'll Accept me again"
+  def handle_info({:async_accept, listener}, conn) do
+    with {:ok, some_ref} <- :prim_inet.async_accept(listener, -1) do
+      {:noreply, %__MODULE__{ref: nil, listener: listener, writer: nil, request: %Request{}}}
+    else
+      {:error, :timeout} ->
+        send(self(), {:async_accept, listener})
+        {:noreply, %{conn | listener: listener}}
+      other ->
+        Logger.warn("async_accept, error -> #{inspect(other)}")
+        send(self(), {:async_accept, listener})
+        {:noreply, %{conn | listener: listener}}
+    end
+  end
+
+  @doc "Second part of unbreaking me 'eart, client is trying to connect after `:prim.accept_async`"
+  def handle_info({:inet_async, listen_socket, ref, {ok, client_socket}}, conn) do
+    # Gotta manually register the socket since we aren't using :gen_tcp.accept.
+    :inet_db.register_socket(client_socket, :inet_tcp)
+    :inet.setopts(client_socket, [{:packet, :http_bin}, {:active, :once}, {:send_timeout_close, true}])
+
+    {:noreply, %{conn | writer: client_socket}}
   end
 
   @doc "Tell the acceptor, to accept a connection"
@@ -51,7 +77,7 @@ defmodule Shorts.Acceptor do
     log(["ERROR! -> received timeout... Closing socket."])
     :gen_tcp.close(conn.writer)
 
-    send(self(), {:accept, listener})
+    send(self(), {@accept_type, listener})
 
     {:noreply, conn}
   end
@@ -91,7 +117,7 @@ defmodule Shorts.Acceptor do
     # Log the connection being closed
     log(["TCP connection closed ...", "Going to checkin self for reuse."])
     # Checkin the acceptor and start accepting again.
-    send(self(), {:accept, listener})
+    send(self(), {@accept_type, listener})
 
     {:noreply, %{conn | writer: nil, request: nil}}
   end
@@ -100,7 +126,7 @@ defmodule Shorts.Acceptor do
   def handle_info({:checkin}, %{listener: listener} = conn) do
     log("Checkin -> Go... ?")
 
-    send(self(), {:accept, listener})
+    send(self(), {@accept_type, listener})
 
     {:noreply, conn}
   end
@@ -196,8 +222,8 @@ defmodule Shorts.Acceptor do
   Logging is insanely slow, this is kind of crazy to see, uncomment to find out
   """
   defp log(message) do
-    ["[acceptor", inspect(self()), "]", " ", message]
-    |> Enum.join("")
-    |> Logger.info()
+#    ["[acceptor", inspect(self()), "]", " ", message]
+#    |> Enum.join("")
+#    |> Logger.info()
   end
 end

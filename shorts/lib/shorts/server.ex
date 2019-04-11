@@ -101,9 +101,9 @@ defmodule Shorts.Server do
   Logging is insanely slow, this is kind of crazy to see, uncomment to find out
   """
   defp log(message) do
-    ["[server", inspect(self()), "]", " ", message]
-    |> Enum.join("")
-    |> Logger.info()
+#    ["[server", inspect(self()), "]", " ", message]
+#    |> Enum.join("")
+#    |> Logger.info()
   end
 
   defp config(key, nil), do: Application.get_env(:shorts, key)

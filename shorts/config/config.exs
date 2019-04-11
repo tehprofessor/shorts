@@ -3,8 +3,8 @@
 use Mix.Config
 
 config :shorts,
-  ip_address: System.get_env("SHORTS_IP") || "127.0.0.1",
-  port: System.get_env("SHORTS_PORT") || 4020
+  ip_address: {192, 168, 1, 182},
+  port: 4020
 
 # This configuration is loaded before any dependency and is restricted
 # to this project. If another project depends on this project, this
